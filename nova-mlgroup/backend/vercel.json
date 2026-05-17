@@ -6,18 +6,10 @@
       "maxDuration": 15
     }
   },
-  "routes": [
-    { "src": "/api/(.*)", "dest": "/api/$1" }
-  ],
-  "env": {
-    "WHATSAPP_ACCESS_TOKEN": "@whatsapp_access_token",
-    "WHATSAPP_PHONE_NUMBER_ID": "@whatsapp_phone_number_id",
-    "WHATSAPP_VERIFY_TOKEN": "@whatsapp_verify_token",
-    "SUPABASE_URL": "@supabase_url",
-    "SUPABASE_SERVICE_ROLE_KEY": "@supabase_service_role_key",
-    "GEMINI_API_KEY": "@gemini_api_key",
-    "OM_PHONE_NUMBER": "@om_phone_number",
-    "OM_BENEFICIARY_NAME": "@om_beneficiary_name",
-    "ENCRYPTION_KEY": "@encryption_key"
-  }
+  "crons": [
+    {
+      "path": "/api/keep-alive",
+      "schedule": "0 6 * * *"
+    }
+  ]
 }
