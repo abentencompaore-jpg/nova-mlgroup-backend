@@ -1,0 +1,21 @@
+{
+  "name": "nova-mlgroup-backend",
+  "version": "1.0.0",
+  "description": "NOVA by ML Group — Backend WhatsApp Bot (Vercel Serverless)",
+  "main": "api/webhook.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^17.4.2",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "vercel": "^37.0.0"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}
