@@ -1,11 +1,15 @@
 // ============================================================
-// 📡 api/webhook.js — Point d'entrée WhatsApp Cloud API
-// Gère : vérification webhook (GET) + réception messages (POST)
+// api/webhook.js — VERSION CORRIGÉE ET COMPLÈTE
+//
+// BUGS CORRIGÉS :
+// 1. Supabase retourne { data, error } — pas { existing } ou { newClient }
+// 2. appendMessageToConversation → messages JSONB (pas table séparée)
+// 3. Status filter → 'delivered' et 'disputed' (pas 'finalized'/'dispute')
+// 4. NOVA IA activée (était commentée)
 // ============================================================
 
 const { createClient } = require('@supabase/supabase-js');
 
-// Client Supabase avec la clé service_role (BACKEND UNIQUEMENT)
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -13,141 +17,122 @@ const supabase = createClient(
 
 module.exports = async (req, res) => {
 
-  // 🔬 ════════════════════════════════════════════════
-  // LOG DE DIAGNOSTIC - À garder pour l'instant
-  // ════════════════════════════════════════════════
-  console.log('═══════════════════════════════════');
-  console.log('📥 REQUÊTE REÇUE');
-  console.log('Méthode :', req.method);
-  console.log('Headers :', JSON.stringify(req.headers, null, 2));
-  console.log('Body :', JSON.stringify(req.body, null, 2));
-  console.log('Query :', JSON.stringify(req.query, null, 2));
-  console.log('═══════════════════════════════════');
-
-  // ──────────────────────────────────────────────
-  // 🔐 MÉTHODE GET : Vérification webhook par Meta
-  // ──────────────────────────────────────────────
+  // ── GET : Vérification webhook Meta ──────────────────────
   if (req.method === 'GET') {
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
+    const mode      = req.query['hub.mode'];
+    const token     = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
 
     if (mode === 'subscribe' && token === process.env.WHATSAPP_VERIFY_TOKEN) {
-      console.log('✅ Webhook vérifié par Meta');
+      console.log('✅ Webhook vérifié');
       return res.status(200).send(challenge);
-    } else {
-      console.error('❌ Token de vérification invalide');
-      console.error('Token reçu :', token);
-      console.error('Token attendu :', process.env.WHATSAPP_VERIFY_TOKEN);
-      return res.status(403).send('Forbidden');
     }
+    return res.status(403).send('Forbidden');
   }
 
-  // ──────────────────────────────────────────────
-  // 📨 MÉTHODE POST : Réception d'un message
-  // ──────────────────────────────────────────────
+  // ── POST : Message entrant ────────────────────────────────
   if (req.method === 'POST') {
-    // ⚡ Répond IMMÉDIATEMENT 200 à Meta (obligatoire < 20s)
+
+    // ⚡ Répond 200 IMMÉDIATEMENT (Meta timeout = 20s)
     res.status(200).send('EVENT_RECEIVED');
 
     try {
-      const body = req.body;
-      const entry = body?.entry?.[0];
-      const changes = entry?.changes?.[0];
-      const value = changes?.value;
+      const body  = req.body;
+      const value = body?.entry?.[0]?.changes?.[0]?.value;
 
-      // Ignore les notifications de statut (delivered, read, sent)
+      // Ignorer les notifications de statut (lu, livré, envoyé)
       if (value?.statuses) {
-        console.log('📊 Statut reçu (ignoré) :', value.statuses[0]?.status);
+        console.log('📊 Statut reçu (ignoré)');
         return;
       }
 
       const message = value?.messages?.[0];
       if (!message) {
-        console.log('⚠️ Payload reçu sans message exploitable');
+        console.log('⚠️ Payload sans message');
         return;
       }
 
-      const senderPhone = message.from;
-      const formattedPhone = '+' + senderPhone;
-      console.log(`📩 Message reçu de ${formattedPhone}`);
+      const senderPhone    = message.from;                   // "22670000000"
+      const formattedPhone = '+' + senderPhone;             // "+22670000000"
+      const senderName     = value.contacts?.[0]?.profile?.name || null;
 
-      // ÉTAPE 1 : Client
-      let client = await getOrCreateClient(
-        formattedPhone,
-        value.contacts?.[0]?.profile?.name
-      );
+      console.log(`📩 Message de ${formattedPhone} : ${message.text?.body?.slice(0, 50)}`);
 
-      // ÉTAPE 2 : Conversation
-      let conversation = await getOrCreateConversation(client.id);
+      // ── 1. Client ───────────────────────────────────────
+      const client = await getOrCreateClient(formattedPhone, senderName);
 
-      // Si admin a repris la main → sauvegarder mais ne pas répondre
+      // ── 2. Conversation ─────────────────────────────────
+      const conversation = await getOrCreateConversation(client.id);
+
+      // Admin en contrôle → bot silencieux
       if (conversation.is_admin_takeover) {
-        console.log(`🔕 Admin en contrôle, bot silencieux`);
-        await appendMessageToConversation(conversation, message, 'user');
+        console.log('🔕 Admin en contrôle, bot silencieux');
+        await saveMessage(conversation, message.text?.body || '', 'user');
         return;
       }
 
-      // ÉTAPE 3 : Extraire contenu
-      let messageContent = null;
-      const messageType = message.type;
-
-      if (messageType === 'text') {
+      // ── 3. Extraire le contenu ───────────────────────────
+      let messageContent = '';
+      if (message.type === 'text') {
         messageContent = message.text.body;
-      } else if (messageType === 'image') {
-        messageContent = `[IMAGE_REÇUE: ${message.image.id}]`;
-      } else if (messageType === 'document') {
-        messageContent = `[DOCUMENT_REÇU: ${message.document.id}]`;
+      } else if (message.type === 'image') {
+        messageContent = '[Image reçue 📷]';
+      } else if (message.type === 'document') {
+        messageContent = '[Document reçu 📄]';
       } else {
-        messageContent = `[TYPE_NON_SUPPORTÉ: ${messageType}]`;
+        messageContent = `[${message.type}]`;
       }
 
-      // ÉTAPE 4 : Sauvegarder message entrant
-      await appendMessageToConversation(conversation, {
-        type: messageType,
-        content: messageContent,
-        timestamp: message.timestamp
-      }, 'user');
-
+      // ── 4. Sauvegarder le message entrant ───────────────
+      await saveMessage(conversation, messageContent, 'user');
       await supabase.from('clients')
         .update({ last_seen_at: new Date().toISOString() })
         .eq('id', client.id);
 
-      // ÉTAPE 5 : Appel IA (commenté pour le test initial)
-      // const { generateAIResponse } = require('./process-ai');
-      // const aiResult = await generateAIResponse({ ... });
+      // ── 5. NOVA répond via Gemini ────────────────────────
+      const { generateAIResponse } = require('./process-ai');
+      const aiResult = await generateAIResponse({
+        supabase,
+        conversation,
+        client,
+        newMessage:  messageContent,
+        messageType: message.type
+      });
 
-      // 🧪 TEST INITIAL : on répond juste "echo" pour valider le flux
-      const { sendWhatsAppMessage } = require('./send-message');
-      const testReply = `🤖 NOVA reçu ton message : "${messageContent}"\n\n(Mode test — l'IA arrive bientôt !)`;
-      await sendWhatsAppMessage(senderPhone, testReply);
+      // ── 6. Envoyer la réponse WhatsApp ───────────────────
+      if (aiResult.responseText) {
+        const { sendWhatsAppMessage } = require('./send-message');
+        await sendWhatsAppMessage(senderPhone, aiResult.responseText);
+        await saveMessage(conversation, aiResult.responseText, 'bot');
+        console.log(`✅ NOVA a répondu (${aiResult.responseText.length} chars)`);
+      }
 
-      await appendMessageToConversation(conversation, {
-        type: 'text',
-        content: testReply,
-        timestamp: Math.floor(Date.now() / 1000)
-      }, 'bot');
-
-      console.log('✅ Réponse envoyée avec succès');
+      // ── 7. Actions système détectées par l'IA ────────────
+      if (aiResult.systemAction) {
+        await handleSystemAction(aiResult.systemAction, conversation, client);
+      }
 
     } catch (error) {
-      console.error('❌ Erreur traitement webhook:', error);
-      console.error('Stack:', error.stack);
+      console.error('❌ Erreur webhook:', error.message);
+      console.error(error.stack);
     }
 
     return;
   }
 
-  // Méthode non supportée
   res.status(405).send('Method Not Allowed');
 };
 
 // ============================================================
-// 🛠️ FONCTIONS UTILITAIRES
+// FONCTIONS UTILITAIRES
 // ============================================================
 
+// ── Récupérer ou créer un client ────────────────────────────
 async function getOrCreateClient(phone, displayName) {
-  const { existing } = await supabase
+
+  // ✅ CORRECTION BUG 1 : Supabase retourne { data, error }
+  //    L'ancien code faisait const { existing } = ... → undefined
+  const { data: existing } = await supabase
     .from('clients')
     .select('*')
     .eq('whatsapp_phone', phone)
@@ -155,74 +140,132 @@ async function getOrCreateClient(phone, displayName) {
 
   if (existing) return existing;
 
-  const { newClient, error } = await supabase
+  const { data: newClient, error } = await supabase
     .from('clients')
     .insert({ whatsapp_phone: phone, display_name: displayName || null })
     .select()
     .single();
 
   if (error) throw new Error(`Création client : ${error.message}`);
-  console.log(`👤 Nouveau client créé : ${phone}`);
+  console.log(`👤 Nouveau client : ${phone}`);
   return newClient;
 }
 
-// ─────────────────────────────────────────────────────────────
+// ── Récupérer ou créer une conversation ─────────────────────
 async function getOrCreateConversation(clientId) {
-  // On cherche une conversation active (pas finalisée, pas en litige)
-  const { existing } = await supabase
+
+  // ✅ CORRECTION BUG 2 : statuts corrects selon le schéma SQL
+  //    L'ancien code utilisait 'finalized' et 'dispute' qui n'existent pas
+  //    Les vrais statuts : 'new', 'in_progress', 'awaiting_payment', 'delivered', 'disputed'
+  const { data: existing } = await supabase
     .from('conversations')
     .select('*')
     .eq('client_id', clientId)
-    .not('status', 'in', '("finalized","dispute")')
+    .not('status', 'in', '("delivered","disputed")')
     .order('last_message_at', { ascending: false })
     .limit(1)
     .maybeSingle();
 
   if (existing) return existing;
 
-  // Sinon on en crée une nouvelle
-  const { newConv, error } = await supabase
+  const { data: newConv, error } = await supabase
     .from('conversations')
     .insert({
-      client_id: clientId,
-      status: 'new',
-      is_bot_active: true,
+      client_id:       clientId,
+      status:          'new',
+      messages:        [],
+      ai_context:      [],
       last_message_at: new Date().toISOString()
     })
     .select()
     .single();
 
   if (error) throw new Error(`Création conversation : ${error.message}`);
-  console.log(`💬 Nouvelle conversation créée : ${newConv.id}`);
+  console.log(`💬 Nouvelle conversation : ${newConv.id}`);
   return newConv;
 }
 
-// ─────────────────────────────────────────────────────────────
-async function appendMessageToConversation(conversation, message, sender) {
-  // Insère le message dans la table messages
-  const senderEnum = sender === 'user' ? 'client' : (sender === 'bot' ? 'nova' : 'admin');
+// ── Sauvegarder un message dans le JSONB ────────────────────
+async function saveMessage(conversation, content, role) {
 
-  const { error: msgError } = await supabase.from('messages').insert({
-    conversation_id: conversation.id,
-    sender: senderEnum,
-    content: message.content || message.text || '',
-    message_type: message.type || 'text',
-    media_url: message.media_url || null,
-    whatsapp_message_id: message.whatsapp_id || null
+  // ✅ CORRECTION BUG 3 : les messages sont dans la colonne JSONB
+  //    de la table conversations — pas dans une table 'messages' séparée
+  const { data: current } = await supabase
+    .from('conversations')
+    .select('messages')
+    .eq('id', conversation.id)
+    .single();
+
+  const messages = current?.messages || [];
+  messages.push({
+    role,
+    content,
+    type:      'text',
+    timestamp: Date.now()
   });
 
-  if (msgError) {
-    console.error('❌ Erreur insertion message:', msgError);
-    return;
-  }
-
-  // Met à jour la conversation avec le dernier message
-  const preview = (message.content || '').substring(0, 80);
   await supabase
     .from('conversations')
     .update({
-      last_message_at: new Date().toISOString(),
-      last_message_preview: preview
+      messages:        messages,
+      last_message_at: new Date().toISOString()
     })
     .eq('id', conversation.id);
+}
+
+// ── Traiter les actions système de l'IA ─────────────────────
+async function handleSystemAction(action, conversation, client) {
+  console.log(`⚡ Action système : ${action.type}`);
+
+  switch (action.type) {
+
+    case 'NEW_ORDER': {
+      const { data: service } = await supabase
+        .from('services')
+        .select('id')
+        .ilike('name', action.service)
+        .single();
+
+      if (service) {
+        const { data: order } = await supabase
+          .from('orders')
+          .insert({
+            client_id:       client.id,
+            service_id:      service.id,
+            duration_months: action.duration || 1,
+            amount_fcfa:     action.amount,
+            status:          'pending'
+          })
+          .select()
+          .single();
+
+        await supabase
+          .from('conversations')
+          .update({ status: 'in_progress', current_order_id: order.id })
+          .eq('id', conversation.id);
+      }
+      break;
+    }
+
+    case 'NOTIFY_ADMIN':
+      await supabase
+        .from('conversations')
+        .update({ status: 'awaiting_payment' })
+        .eq('id', conversation.id);
+
+      if (conversation.current_order_id) {
+        await supabase
+          .from('orders')
+          .update({ status: 'payment_received' })
+          .eq('id', conversation.current_order_id);
+      }
+      break;
+
+    case 'ESCALATE_TO_ADMIN':
+      await supabase
+        .from('conversations')
+        .update({ status: 'disputed' })
+        .eq('id', conversation.id);
+      break;
+  }
 }
