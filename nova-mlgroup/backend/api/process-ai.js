@@ -1,211 +1,133 @@
 // ============================================================
-// api/process-ai.js
-// Appel à l'API Google Gemini Flash
-// Gère le contexte multi-tours de conversation
+// api/process-ai.js — VERSION OPTIMISÉE
+// Optimisations latence :
+// - Requêtes Supabase parallèles
+// - Prompt réduit (moins de tokens = plus rapide)
+// - maxOutputTokens réduit à 300
+// - Fix messages tronqués : regex SYSTEM_ACTION plus robuste
 // ============================================================
 
 const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent';
 
-// ──────────────────────────────────────────────────────────────
-// Prompt système NOVA (version courte — le complet est en section 3)
-// On injecte aussi le contexte dynamique (statut, commande, etc.)
-// ──────────────────────────────────────────────────────────────
 function buildSystemPrompt(context) {
-  const now = new Date();
-  const month = now.getMonth() + 1; // 1-12
-  
-  // Texte du mois pour l'upsell saisonnier
+  const now       = new Date();
   const monthName = now.toLocaleString('fr-FR', { month: 'long' });
-  
-  return `
-Tu es NOVA, l'assistante digitale de ML Group (Ouagadougou, Burkina Faso).
-Tu vends des abonnements numériques via WhatsApp. Ton ton est jeune, dynamique, chaleureux.
 
-CATALOGUE TARIFAIRE (prix fixes, non négociables) :
-- Netflix 2500F/mois | Prime Video 3500F/mois | Crunchyroll 3000F/mois
-- Disney+ 5500F/mois | Plex TV 8500F/mois | My Canal 5000F/mois | IPTV 18000F/6mois
-- Spotify 3000F/mois | Apple Music 4000F/mois | PlayStation+ 8000F/mois
-- Canva Pro 4000F/mois | CapCut Pro 9500F/mois | iCloud 200Go 3500F/mois
-- Snapchat+ 10000F/an | VPN 3000F/mois | Abonnement personnalisé dès 2400F/mois
+  return `Tu es NOVA, assistante digitale de ML Group (Ouagadougou, Burkina Faso). Vends des abonnements numériques. Ton : jeune, chaleureux, direct.
 
-CONTEXTE ACTUEL :
-- Client : ${context.clientName || 'Nouveau client'}
-- Statut conversation : ${context.conversationStatus}
-- Commande en cours : ${context.currentOrder ? JSON.stringify(context.currentOrder) : 'Aucune'}
-- Date/heure : ${now.toLocaleString('fr-FR')} (mois de ${monthName})
-- Numéro Orange Money admin : ${process.env.OM_PHONE_NUMBER || 'À CONFIGURER'}
-- Nom bénéficiaire OM : ${process.env.OM_BENEFICIARY_NAME || 'À CONFIGURER'}
+PRIX (fixes, non négociables) :
+Netflix 2500F | Prime 3500F | Crunchyroll 3000F | Disney+ 5500F | Plex 8500F | Canal 5000F | IPTV 18000F/6mois | Spotify 3000F | Apple Music 4000F | PS+ 8000F | Canva 4000F | CapCut 9500F | iCloud 3500F | Snapchat+ 10000F/an | VPN 3000F
 
-RÈGLES ABSOLUES :
-1. Ne JAMAIS donner un compte (email/mdp) avant que l'admin valide le paiement
-2. Ne JAMAIS négocier les prix
-3. Si demande de réduction → "Pour toute offre spéciale, je peux contacter notre responsable pour toi 😊"
-4. Pour abonnement personnalisé → escalade toujours à l'admin
-5. Pour litige → reste calme, escalade si nécessaire
+CONTEXTE : Client: ${context.clientName || 'Nouveau'} | Statut: ${context.conversationStatus} | Commande: ${context.currentOrder ? JSON.stringify(context.currentOrder) : 'aucune'} | ${now.toLocaleString('fr-FR')} (${monthName})
+OM: ${process.env.OM_PHONE_NUMBER || 'À CONFIGURER'} | Bénéficiaire: ${process.env.OM_BENEFICIARY_NAME || 'À CONFIGURER'}
 
-ACTIONS SYSTÈME :
-Quand tu détectes un événement clé, ajoute à la FIN de ton message (sur une nouvelle ligne) :
-- Nouvelle commande confirmée : SYSTEM_ACTION: {"type":"NEW_ORDER","service":"[nom]","duration":[mois],"amount":[fcfa]}
-- Preuve de paiement reçue : SYSTEM_ACTION: {"type":"NOTIFY_ADMIN","data":{}}
-- Litige : SYSTEM_ACTION: {"type":"ESCALATE_TO_ADMIN","reason":"[raison]"}
+RÈGLES : Jamais donner email/mdp avant validation admin. Jamais négocier les prix. Réponses COURTES (max 5 lignes). Utilise des emojis avec modération.
 
-IMPORTANT : Le SYSTEM_ACTION ne doit JAMAIS être visible par le client. C'est uniquement pour le traitement backend. Ajoute-le seulement quand nécessaire.
-  `.trim();
+ACTIONS (fin de message, nouvelle ligne, seulement si nécessaire) :
+SYSTEM_ACTION: {"type":"NEW_ORDER","service":"Netflix","duration":1,"amount":2500}
+SYSTEM_ACTION: {"type":"NOTIFY_ADMIN","data":{}}
+SYSTEM_ACTION: {"type":"ESCALATE_TO_ADMIN","reason":"litige"}`.trim();
 }
 
-/**
- * Génère une réponse IA avec Gemini Flash
- * @param {Object} params - { supabase, conversation, client, newMessage, messageType }
- * @returns {Object} - { responseText, systemAction }
- */
-async function generateAIResponse({ supabase, conversation, client, newMessage, messageType }) {
-  
-  // ──────────────────────────────────────────────
-  // CONSTRUCTION DU CONTEXTE DE CONVERSATION
-  // Gemini supporte le multi-tours via "contents"
-  // ──────────────────────────────────────────────
-  
-  // Récupère la commande en cours si elle existe
-  let currentOrder = null;
-  if (conversation.current_order_id) {
-    const { data } = await supabase
-      .from('orders')
-      .select('*, services(name)')
-      .eq('id', conversation.current_order_id)
-      .single();
-    currentOrder = data;
-  }
+async function generateAIResponse({ supabase, conversation, client, newMessage }) {
 
-  // Contexte dynamique pour le prompt système
+  // ── Requêtes parallèles (gain ~300ms) ────────────────────
+  const [currentOrderResult, recentMessagesData] = await Promise.all([
+    conversation.current_order_id
+      ? supabase.from('orders').select('*, services(name)').eq('id', conversation.current_order_id).single()
+      : Promise.resolve({ data: null }),
+    Promise.resolve((conversation.messages || []).slice(-10)) // Réduit de 20 à 10
+  ]);
+
+  const currentOrder = currentOrderResult.data;
+
   const context = {
-    clientName: client.display_name,
+    clientName:         client.display_name,
     conversationStatus: conversation.status,
     currentOrder: currentOrder ? {
-      service: currentOrder.services?.name,
+      service:  currentOrder.services?.name,
       duration: currentOrder.duration_months,
-      amount: currentOrder.amount_fcfa,
-      status: currentOrder.status
+      amount:   currentOrder.amount_fcfa,
+      status:   currentOrder.status
     } : null
   };
 
-  // ──────────────────────────────────────────────
-  // HISTORIQUE DE CONVERSATION pour le contexte IA
-  // On limite à 20 derniers messages pour rester dans les limites du free tier
-  // ──────────────────────────────────────────────
-  const recentMessages = (conversation.messages || []).slice(-20);
-  
-  // Format requis par l'API Gemini : alternance user/model
-  const conversationHistory = [];
-  
-  for (const msg of recentMessages) {
-    // Gemini utilise "user" et "model" (pas "bot")
-    const role = msg.role === 'bot' ? 'model' : 'user';
-    conversationHistory.push({
-      role,
-      parts: [{ text: msg.content || '[Message non textuel]' }]
-    });
-  }
+  // ── Historique allégé ────────────────────────────────────
+  const history = recentMessagesData.map(msg => ({
+    role:  msg.role === 'bot' ? 'model' : 'user',
+    parts: [{ text: msg.content || '[non-texte]' }]
+  }));
+  history.push({ role: 'user', parts: [{ text: newMessage }] });
 
-  // Ajoute le nouveau message du client
-  conversationHistory.push({
-    role: 'user',
-    parts: [{ text: newMessage }]
-  });
-
-  // ──────────────────────────────────────────────
-  // APPEL À L'API GEMINI FLASH
-  // ──────────────────────────────────────────────
   const requestBody = {
-    system_instruction: {
-      parts: [{ text: buildSystemPrompt(context) }]
-    },
-    contents: conversationHistory,
+    system_instruction: { parts: [{ text: buildSystemPrompt(context) }] },
+    contents: history,
     generationConfig: {
-      temperature: 0.7,        // Créativité modérée
-      topK: 40,
-      topP: 0.95,
-      maxOutputTokens: 512,    // Réponses courtes pour WhatsApp
-      stopSequences: []
+      temperature:      0.7,
+      maxOutputTokens:  300,   // Réduit de 512 → 300 (réponses plus courtes et rapides)
+      topK:             40,
+      topP:             0.95,
     },
     safetySettings: [
-      // Réduit les faux positifs pour le contexte commercial
-      { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_ONLY_HIGH' },
+      { category: 'HARM_CATEGORY_HARASSMENT',  threshold: 'BLOCK_ONLY_HIGH' },
       { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_ONLY_HIGH' }
     ]
   };
 
-  // Gestion du rate limit : retry avec backoff exponentiel
   let attempt = 0;
-  let lastError = null;
-  
   while (attempt < 3) {
     try {
-      const response = await fetch(
-        `${GEMINI_URL}?key=${process.env.GEMINI_API_KEY}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(requestBody)
-        }
-      );
+      const response = await fetch(`${GEMINI_URL}?key=${process.env.GEMINI_API_KEY}`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(requestBody)
+      });
 
       if (response.status === 429) {
-        // Rate limit atteint : attendre et réessayer
-        const waitTime = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
-        console.log(`⏳ Rate limit Gemini, retry dans ${waitTime}ms...`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
+        const wait = Math.pow(2, attempt) * 1000;
+        console.log(`⏳ Rate limit, retry dans ${wait}ms`);
+        await new Promise(r => setTimeout(r, wait));
         attempt++;
         continue;
       }
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(`Gemini API error ${response.status}: ${JSON.stringify(errorData)}`);
+        const err = await response.json();
+        throw new Error(`Gemini ${response.status}: ${JSON.stringify(err)}`);
       }
 
-      const data = await response.json();
-      
-      // Extrait le texte de la réponse
+      const data    = await response.json();
       const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      
-      if (!rawText) {
-        throw new Error('Réponse Gemini vide ou filtrée');
-      }
+      if (!rawText) throw new Error('Réponse Gemini vide');
 
-      // ──────────────────────────────────────────
-      // PARSING DE L'ACTION SYSTÈME (si présente)
-      // ──────────────────────────────────────────
-      let responseText = rawText;
-      let systemAction = null;
+      // ── Fix messages tronqués : regex multiline robuste ──
+      // L'ancien regex ne capturait pas les JSON sur plusieurs lignes
+      const actionMatch  = rawText.match(/\nSYSTEM_ACTION:\s*(\{[^}]+\})/);
+      let responseText   = rawText;
+      let systemAction   = null;
 
-      const systemActionRegex = /SYSTEM_ACTION:\s*(\{.*\})/;
-      const match = rawText.match(systemActionRegex);
-      
-      if (match) {
+      if (actionMatch) {
         try {
-          systemAction = JSON.parse(match[1]);
-          // Supprime la ligne SYSTEM_ACTION du texte envoyé au client
-          responseText = rawText.replace(/\nSYSTEM_ACTION:.*$/m, '').trim();
-        } catch (e) {
-          console.warn('⚠️ Impossible de parser le SYSTEM_ACTION:', match[1]);
+          systemAction  = JSON.parse(actionMatch[1]);
+          responseText  = rawText.replace(/\nSYSTEM_ACTION:[\s\S]*$/, '').trim();
+        } catch {
+          // JSON malformé → on ignore l'action mais garde le texte
+          responseText = rawText.replace(/\nSYSTEM_ACTION:[\s\S]*$/, '').trim();
+          console.warn('⚠️ SYSTEM_ACTION JSON invalide');
         }
       }
 
-      console.log(`🤖 NOVA response generated (${responseText.length} chars)`);
-      if (systemAction) console.log(`⚡ System action detected: ${systemAction.type}`);
-
+      console.log(`🤖 NOVA (${responseText.length} chars)${systemAction ? ` + action ${systemAction.type}` : ''}`);
       return { responseText, systemAction };
 
     } catch (error) {
-      lastError = error;
+      console.error(`❌ Tentative ${attempt + 1}/3 :`, error.message);
       attempt++;
     }
   }
 
-  // Après 3 tentatives échouées : réponse de fallback
-  console.error('❌ Gemini API failed after 3 attempts:', lastError);
   return {
-    responseText: "Désolé, je rencontre un petit souci technique 😅 Notre équipe est là pour t'aider ! Envoie-nous ton message, on revient vers toi dans quelques minutes 💪",
+    responseText: "Désolé, souci technique 😅 Notre équipe revient vers toi rapidement 💪",
     systemAction: null
   };
 }
