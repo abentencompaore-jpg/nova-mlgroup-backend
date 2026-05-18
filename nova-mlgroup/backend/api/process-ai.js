@@ -141,7 +141,7 @@ async function generateAIResponse({ supabase, conversation, client, newMessage, 
   while (attempt < 3) {
     try {
       const response = await fetch(
-        `${GEMINI_API_URL}?key=${process.env.GEMINI_API_KEY}`,
+        `${GEMINI_URL}?key=${process.env.GEMINI_API_KEY}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
