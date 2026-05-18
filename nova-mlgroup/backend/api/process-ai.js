@@ -4,7 +4,7 @@
 // Gère le contexte multi-tours de conversation
 // ============================================================
 
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent';
+const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent';
 
 // ──────────────────────────────────────────────────────────────
 // Prompt système NOVA (version courte — le complet est en section 3)
