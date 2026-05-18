@@ -21,7 +21,22 @@ module.exports = async (req, res) => {
   }
 
   if (req.method === 'POST') {
-    res.status(200).send('EVENT_RECEIVED');
+
+  // ⚡ NOUVEAU : traitement D'ABORD, réponse ENSUITE
+  // WhatsApp attend max 20s — on a largement le temps
+  try {
+    const body  = req.body;
+    const value = body?.entry?.[0]?.changes?.[0]?.value;
+
+    if (!value?.statuses && value?.messages?.[0]) {
+      // ... tout le traitement ici ...
+    }
+  } catch (error) {
+    console.error('❌ ERREUR :', error.message);
+  }
+
+  // Répond 200 À LA FIN (mais toujours dans les 20s)
+  return res.status(200).send('EVENT_RECEIVED');
 
     try {
       // ── DIAGNOSTIC 1 : Variables d'environnement ──────────
