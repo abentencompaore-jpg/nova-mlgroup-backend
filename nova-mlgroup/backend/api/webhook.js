@@ -1,169 +1,140 @@
 // ============================================================
-// api/webhook.js
-// Point d'entrée WhatsApp Cloud API
+// 📡 api/webhook.js — Point d'entrée WhatsApp Cloud API
 // Gère : vérification webhook (GET) + réception messages (POST)
 // ============================================================
 
 const { createClient } = require('@supabase/supabase-js');
 
-// Initialise le client Supabase avec la clé service_role
-// IMPORTANT : Ne jamais exposer cette clé côté client mobile
+// Client Supabase avec la clé service_role (BACKEND UNIQUEMENT)
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 module.exports = async (req, res) => {
-  
+
+  // 🔬 ════════════════════════════════════════════════
+  // LOG DE DIAGNOSTIC - À garder pour l'instant
+  // ════════════════════════════════════════════════
+  console.log('═══════════════════════════════════');
+  console.log('📥 REQUÊTE REÇUE');
+  console.log('Méthode :', req.method);
+  console.log('Headers :', JSON.stringify(req.headers, null, 2));
+  console.log('Body :', JSON.stringify(req.body, null, 2));
+  console.log('Query :', JSON.stringify(req.query, null, 2));
+  console.log('═══════════════════════════════════');
+
   // ──────────────────────────────────────────────
-  // MÉTHODE GET : Vérification du webhook par Meta
-  // Meta envoie un GET avec un challenge à renvoyer
+  // 🔐 MÉTHODE GET : Vérification webhook par Meta
   // ──────────────────────────────────────────────
   if (req.method === 'GET') {
-    const mode      = req.query['hub.mode'];
-    const token     = req.query['hub.verify_token'];
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
 
-    // Vérifie que le token correspond à notre secret
     if (mode === 'subscribe' && token === process.env.WHATSAPP_VERIFY_TOKEN) {
       console.log('✅ Webhook vérifié par Meta');
-      return res.status(200).send(challenge); // Renvoie le challenge pour validation
+      return res.status(200).send(challenge);
     } else {
       console.error('❌ Token de vérification invalide');
+      console.error('Token reçu :', token);
+      console.error('Token attendu :', process.env.WHATSAPP_VERIFY_TOKEN);
       return res.status(403).send('Forbidden');
     }
   }
 
   // ──────────────────────────────────────────────
-  // MÉTHODE POST : Réception d'un nouveau message
+  // 📨 MÉTHODE POST : Réception d'un message
   // ──────────────────────────────────────────────
   if (req.method === 'POST') {
-    
-    // Répond IMMÉDIATEMENT 200 à Meta (obligatoire < 20 secondes)
-    // On traite ensuite en asynchrone
+    // ⚡ Répond IMMÉDIATEMENT 200 à Meta (obligatoire < 20s)
     res.status(200).send('EVENT_RECEIVED');
 
     try {
       const body = req.body;
-
-      // Structure typique d'un message WhatsApp reçu
-      // body.entry[0].changes[0].value contient le message
       const entry = body?.entry?.[0];
       const changes = entry?.changes?.[0];
       const value = changes?.value;
 
-      // Ignore les notifications de statut (delivered, read, etc.)
+      // Ignore les notifications de statut (delivered, read, sent)
       if (value?.statuses) {
-        console.log('📊 Notification de statut reçue (ignorée)');
+        console.log('📊 Statut reçu (ignoré) :', value.statuses[0]?.status);
         return;
       }
 
-      // Récupère le premier message du tableau
       const message = value?.messages?.[0];
       if (!message) {
-        console.log('⚠️ Payload reçu sans message');
+        console.log('⚠️ Payload reçu sans message exploitable');
         return;
       }
 
-      // Récupère le numéro de téléphone de l'expéditeur
-      const senderPhone = message.from; // Format: "22670000000" (sans le +)
-      const formattedPhone = '+' + senderPhone; // On ajoute le + pour notre BDD
-
+      const senderPhone = message.from;
+      const formattedPhone = '+' + senderPhone;
       console.log(`📩 Message reçu de ${formattedPhone}`);
 
-      // ──────────────────────────────────────────
-      // ÉTAPE 1 : Identifier ou créer le client
-      // ──────────────────────────────────────────
-      let client = await getOrCreateClient(supabase, formattedPhone, value.contacts?.[0]?.profile?.name);
+      // ÉTAPE 1 : Client
+      let client = await getOrCreateClient(
+        formattedPhone,
+        value.contacts?.[0]?.profile?.name
+      );
 
-      // ──────────────────────────────────────────
-      // ÉTAPE 2 : Identifier ou créer la conversation
-      // ──────────────────────────────────────────
-      let conversation = await getOrCreateConversation(supabase, client.id);
+      // ÉTAPE 2 : Conversation
+      let conversation = await getOrCreateConversation(client.id);
 
-      // Si l'admin a repris la main, le bot ne répond pas
+      // Si admin a repris la main → sauvegarder mais ne pas répondre
       if (conversation.is_admin_takeover) {
-        console.log(`🔕 Admin en contrôle pour ${formattedPhone}, bot silencieux`);
-        // On sauvegarde quand même le message entrant
-        await appendMessageToConversation(supabase, conversation, message, 'user');
+        console.log(`🔕 Admin en contrôle, bot silencieux`);
+        await appendMessageToConversation(conversation, message, 'user');
         return;
       }
 
-      // ──────────────────────────────────────────
-      // ÉTAPE 3 : Extraire le contenu du message
-      // Supporte texte, image (screenshot OM), audio
-      // ──────────────────────────────────────────
+      // ÉTAPE 3 : Extraire contenu
       let messageContent = null;
-      let messageType = message.type;
+      const messageType = message.type;
 
       if (messageType === 'text') {
         messageContent = message.text.body;
       } else if (messageType === 'image') {
-        // Le client a envoyé un screenshot Orange Money
-        // On sauvegarde l'ID de l'image pour la récupérer
         messageContent = `[IMAGE_REÇUE: ${message.image.id}]`;
-        // Optionnel : récupérer et stocker l'image dans Supabase Storage
       } else if (messageType === 'document') {
         messageContent = `[DOCUMENT_REÇU: ${message.document.id}]`;
       } else {
-        // Type non supporté (audio, vidéo, etc.)
-        messageContent = `[MESSAGE_TYPE_NON_SUPPORTÉ: ${messageType}]`;
+        messageContent = `[TYPE_NON_SUPPORTÉ: ${messageType}]`;
       }
 
-      // ──────────────────────────────────────────
-      // ÉTAPE 4 : Sauvegarder le message entrant en BDD
-      // ──────────────────────────────────────────
-      await appendMessageToConversation(supabase, conversation, {
+      // ÉTAPE 4 : Sauvegarder message entrant
+      await appendMessageToConversation(conversation, {
         type: messageType,
         content: messageContent,
         timestamp: message.timestamp
       }, 'user');
 
-      // Mise à jour du timestamp last_seen du client
       await supabase.from('clients')
         .update({ last_seen_at: new Date().toISOString() })
         .eq('id', client.id);
 
-      // ──────────────────────────────────────────
-      // ÉTAPE 5 : Appel à l'IA (process-ai.js)
-      // ──────────────────────────────────────────
-      const { generateAIResponse } = require('./process-ai');
-      
-      const aiResult = await generateAIResponse({
-        supabase,
-        conversation,
-        client,
-        newMessage: messageContent,
-        messageType
-      });
+      // ÉTAPE 5 : Appel IA (commenté pour le test initial)
+      // const { generateAIResponse } = require('./process-ai');
+      // const aiResult = await generateAIResponse({ ... });
 
-      // ──────────────────────────────────────────
-      // ÉTAPE 6 : Envoi de la réponse au client
-      // ──────────────────────────────────────────
-      if (aiResult.responseText) {
-        const { sendWhatsAppMessage } = require('./send-message');
-        await sendWhatsAppMessage(senderPhone, aiResult.responseText);
+      // 🧪 TEST INITIAL : on répond juste "echo" pour valider le flux
+      const { sendWhatsAppMessage } = require('./send-message');
+      const testReply = `🤖 NOVA reçu ton message : "${messageContent}"\n\n(Mode test — l'IA arrive bientôt !)`;
+      await sendWhatsAppMessage(senderPhone, testReply);
 
-        // Sauvegarde la réponse du bot en BDD
-        await appendMessageToConversation(supabase, conversation, {
-          type: 'text',
-          content: aiResult.responseText,
-          timestamp: Math.floor(Date.now() / 1000)
-        }, 'bot');
-      }
+      await appendMessageToConversation(conversation, {
+        type: 'text',
+        content: testReply,
+        timestamp: Math.floor(Date.now() / 1000)
+      }, 'bot');
 
-      // ──────────────────────────────────────────
-      // ÉTAPE 7 : Traiter les actions système détectées
-      // ──────────────────────────────────────────
-      if (aiResult.systemAction) {
-        await handleSystemAction(supabase, aiResult.systemAction, conversation, client);
-      }
+      console.log('✅ Réponse envoyée avec succès');
 
     } catch (error) {
-      // Log l'erreur mais ne renvoie pas d'erreur à Meta (déjà répondu 200)
       console.error('❌ Erreur traitement webhook:', error);
+      console.error('Stack:', error.stack);
     }
-    
+
     return;
   }
 
@@ -172,160 +143,86 @@ module.exports = async (req, res) => {
 };
 
 // ============================================================
-// FONCTIONS UTILITAIRES
+// 🛠️ FONCTIONS UTILITAIRES
 // ============================================================
 
-/**
- * Récupère un client existant ou en crée un nouveau
- */
-async function getOrCreateClient(supabase, phone, displayName) {
-  // Cherche le client par son numéro
-  const { data: existing } = await supabase
+async function getOrCreateClient(phone, displayName) {
+  const { existing } = await supabase
     .from('clients')
     .select('*')
     .eq('whatsapp_phone', phone)
-    .single();
+    .maybeSingle();
 
   if (existing) return existing;
 
-  // Crée un nouveau client
-  const { data: newClient, error } = await supabase
+  const { newClient, error } = await supabase
     .from('clients')
     .insert({ whatsapp_phone: phone, display_name: displayName || null })
     .select()
     .single();
 
-  if (error) throw new Error(`Erreur création client: ${error.message}`);
-  console.log(`👤 Nouveau client créé: ${phone}`);
+  if (error) throw new Error(`Création client : ${error.message}`);
+  console.log(`👤 Nouveau client créé : ${phone}`);
   return newClient;
 }
 
-/**
- * Récupère la conversation active ou en crée une nouvelle
- */
-async function getOrCreateConversation(supabase, clientId) {
-  // Cherche une conversation non terminée
-  const { data: existing } = await supabase
+// ─────────────────────────────────────────────────────────────
+async function getOrCreateConversation(clientId) {
+  // On cherche une conversation active (pas finalisée, pas en litige)
+  const { existing } = await supabase
     .from('conversations')
     .select('*')
     .eq('client_id', clientId)
-    .not('status', 'eq', 'delivered') // Les conversations finalisées restent mais inactives
+    .not('status', 'in', '("finalized","dispute")')
     .order('last_message_at', { ascending: false })
     .limit(1)
-    .single();
+    .maybeSingle();
 
   if (existing) return existing;
 
-  // Crée une nouvelle conversation
-  const { data: newConv, error } = await supabase
+  // Sinon on en crée une nouvelle
+  const { newConv, error } = await supabase
     .from('conversations')
     .insert({
       client_id: clientId,
       status: 'new',
-      messages: [],
-      ai_context: []
+      is_bot_active: true,
+      last_message_at: new Date().toISOString()
     })
     .select()
     .single();
 
-  if (error) throw new Error(`Erreur création conversation: ${error.message}`);
+  if (error) throw new Error(`Création conversation : ${error.message}`);
+  console.log(`💬 Nouvelle conversation créée : ${newConv.id}`);
   return newConv;
 }
 
-/**
- * Ajoute un message à l'historique de la conversation
- */
-async function appendMessageToConversation(supabase, conversation, messageData, role) {
-  const newMessage = {
-    role,            // 'user' ou 'bot'
-    content: messageData.content || messageData.text?.body,
-    type: messageData.type || 'text',
-    timestamp: messageData.timestamp || Math.floor(Date.now() / 1000)
-  };
+// ─────────────────────────────────────────────────────────────
+async function appendMessageToConversation(conversation, message, sender) {
+  // Insère le message dans la table messages
+  const senderEnum = sender === 'user' ? 'client' : (sender === 'bot' ? 'nova' : 'admin');
 
-  // Récupère les messages actuels et ajoute le nouveau
-  const currentMessages = conversation.messages || [];
-  const updatedMessages = [...currentMessages, newMessage];
+  const { error: msgError } = await supabase.from('messages').insert({
+    conversation_id: conversation.id,
+    sender: senderEnum,
+    content: message.content || message.text || '',
+    message_type: message.type || 'text',
+    media_url: message.media_url || null,
+    whatsapp_message_id: message.whatsapp_id || null
+  });
 
+  if (msgError) {
+    console.error('❌ Erreur insertion message:', msgError);
+    return;
+  }
+
+  // Met à jour la conversation avec le dernier message
+  const preview = (message.content || '').substring(0, 80);
   await supabase
     .from('conversations')
     .update({
-      messages: updatedMessages,
-      last_message_at: new Date().toISOString()
+      last_message_at: new Date().toISOString(),
+      last_message_preview: preview
     })
     .eq('id', conversation.id);
-}
-
-/**
- * Traite les actions système détectées dans la réponse de l'IA
- */
-async function handleSystemAction(supabase, action, conversation, client) {
-  console.log(`⚡ Action système: ${action.type}`);
-
-  switch (action.type) {
-    case 'NEW_ORDER':
-      // Crée une commande en base
-      const { data: service } = await supabase
-        .from('services')
-        .select('id')
-        .ilike('name', action.service)
-        .single();
-      
-      if (service) {
-        const { data: order } = await supabase
-          .from('orders')
-          .insert({
-            client_id: client.id,
-            service_id: service.id,
-            duration_months: action.duration || 1,
-            amount_fcfa: action.amount,
-            status: 'pending'
-          })
-          .select()
-          .single();
-
-        // Lie la commande à la conversation
-        await supabase
-          .from('conversations')
-          .update({ 
-            status: 'in_progress',
-            current_order_id: order.id 
-          })
-          .eq('id', conversation.id);
-      }
-      break;
-
-    case 'NOTIFY_ADMIN':
-      // Met le statut de la conversation en "awaiting_payment"
-      await supabase
-        .from('conversations')
-        .update({ status: 'awaiting_payment' })
-        .eq('id', conversation.id);
-      
-      // Met à jour le statut de la commande en cours
-      if (conversation.current_order_id) {
-        await supabase
-          .from('orders')
-          .update({ status: 'payment_received' })
-          .eq('id', conversation.current_order_id);
-      }
-      // Note : la notification push vers l'app admin se fait via Supabase Realtime
-      // L'app mobile écoute les changements de statut en temps réel
-      break;
-
-    case 'ESCALATE_TO_ADMIN':
-      // Met le statut en litige
-      await supabase
-        .from('conversations')
-        .update({ status: 'disputed' })
-        .eq('id', conversation.id);
-      
-      if (conversation.current_order_id) {
-        await supabase
-          .from('orders')
-          .update({ status: 'disputed' })
-          .eq('id', conversation.current_order_id);
-      }
-      break;
-  }
 }
