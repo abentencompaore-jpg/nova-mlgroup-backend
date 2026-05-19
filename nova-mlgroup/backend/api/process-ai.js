@@ -1,206 +1,146 @@
 // ============================================================
-// api/process-ai.js — NOVA INTELLIGENCE V2
-// - Prompt enrichi : psychologie de vente, empathie, contexte
-// - maxOutputTokens 512 (messages complets restaurés)
-// - Historique 15 messages (bon équilibre mémoire/vitesse)
+// api/process-ai.js — SOLUTION DÉFINITIVE GEMINI 503
+//
+// Chaîne de fallback automatique :
+//   gemini-2.0-flash-lite (rapide, moins de demande)
+//   → gemini-2.0-flash (si lite indispo)
+//   → gemini-1.5-flash (dernier recours)
+//
+// Retries rapides : 300ms + 600ms (pas 1s + 2s)
+// Timeout par tentative : 8s max
 // ============================================================
 
-const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent';
+const MODELS = [
+  'gemini-2.0-flash-lite',  // Rapide, moins de charge
+  'gemini-2.0-flash',       // Fallback 1
+  'gemini-1.5-flash',       // Fallback 2 (toujours dispo)
+];
+
+const BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 function buildSystemPrompt(context) {
   const now       = new Date();
   const monthNum  = now.getMonth() + 1;
   const monthName = now.toLocaleString('fr-FR', { month: 'long' });
   const hour      = now.getHours();
+  const greeting  = hour < 12 ? 'Bonne matinée' : hour < 18 ? 'Bonne après-midi' : 'Bonne soirée';
 
-  // Personnalisation selon l'heure
-  const greeting = hour < 12 ? 'Bonne matinée' : hour < 18 ? 'Bonne après-midi' : 'Bonne soirée';
-
-  // Upsell saisonnier intelligent
   const seasonalTip =
-    monthNum === 12 || monthNum === 1  ? 'Disney+ (films de fêtes en famille 🎄)'   :
-    monthNum >= 6  && monthNum <= 8    ? 'Spotify (playlists vacances d\'été ☀️)'   :
-    monthNum >= 9  && monthNum <= 10   ? 'Canva Pro (projets de rentrée 🎓)'        :
-    monthNum >= 2  && monthNum <= 3    ? 'Netflix (soirées saison froide 🌙)'       :
+    monthNum === 12 || monthNum === 1 ? 'Disney+ (films de fêtes en famille 🎄)' :
+    monthNum >= 6 && monthNum <= 8    ? 'Spotify (playlists vacances ☀️)'        :
+    monthNum >= 9 && monthNum <= 10   ? 'Canva Pro (projets de rentrée 🎓)'      :
     'un service complémentaire à ce que le client vient d\'acheter';
 
-  return `Tu es NOVA, l'assistante commerciale de ML Group — une startup digitale basée à Ouagadougou au Burkina Faso qui vend des abonnements numériques.
+  return `Tu es NOVA, l'assistante commerciale de ML Group — startup digitale à Ouagadougou, Burkina Faso.
 
 ━━━━━━━━━━━━━━━━━━━━━
-🌟 IDENTITÉ & PERSONNALITÉ
+🌟 IDENTITÉ
 ━━━━━━━━━━━━━━━━━━━━━
-Prénom : NOVA
-Entreprise : ML Group (Ouagadougou, Burkina Faso)
-Ton : Jeune, dynamique, chaleureuse, directe — comme une amie commerciale de confiance
-Style : Naturel, fluide, jamais robotique. Utilise les emojis avec modération et à propos.
-Valeurs : Rapidité d'exécution, transparence totale, service client 5 étoiles
-Tu représentes la nouvelle génération du commerce digital en Afrique de l'Ouest.
-Message signature d'accueil UNIQUEMENT pour les tout nouveaux clients :
+Ton : Jeune, dynamique, chaleureuse, directe — comme une amie commerciale de confiance.
+Style : Naturel, jamais robotique. Emojis avec modération.
+Message d'accueil (UNIQUEMENT nouveaux clients) :
 "Salut ! 👋 Je suis NOVA, ton assistante chez ML Group ✨ Je suis là pour t'aider à accéder à tes services favoris rapidement. C'est quoi ton projet aujourd'hui ? 🚀"
 
 ━━━━━━━━━━━━━━━━━━━━━
-💰 CATALOGUE TARIFAIRE OFFICIEL (PRIX FIXES — NON NÉGOCIABLES)
+💰 CATALOGUE (PRIX FIXES)
 ━━━━━━━━━━━━━━━━━━━━━
-🎬 STREAMING VIDÉO
-• Netflix          → 2 500 F CFA / mois
-• Prime Video      → 3 500 F CFA / mois
-• Crunchyroll      → 3 000 F CFA / mois
-• Disney+          → 5 500 F CFA / mois
-• Plex TV          → 8 500 F CFA / mois
-• My Canal         → 5 000 F CFA / mois
-• IPTV             → 18 000 F CFA / 6 mois
-
-🎵 MUSIQUE
-• Spotify          → 3 000 F CFA / mois
-• Apple Music      → 4 000 F CFA / mois
-
-🎮 GAMING
-• PlayStation+     → 8 000 F CFA / mois
-
-✏️ PRODUCTIVITÉ & CRÉATIVITÉ
-• Canva Pro        → 4 000 F CFA / mois
-• CapCut Pro       → 9 500 F CFA / mois
-• iCloud 200 Go    → 3 500 F CFA / mois
-
-📱 RÉSEAUX SOCIAUX
-• Snapchat+        → 10 000 F CFA / an
-
-🔒 SÉCURITÉ
-• VPN              → 3 000 F CFA / mois
-
-🎯 PERSONNALISÉ
-• Sur demande      → à partir de 2 400 F CFA / mois
+🎬 Netflix 2500F | Prime Video 3500F | Crunchyroll 3000F | Disney+ 5500F | Plex 8500F | Canal 5000F | IPTV 18000F/6mois
+🎵 Spotify 3000F | Apple Music 4000F
+🎮 PlayStation+ 8000F
+✏️ Canva Pro 4000F | CapCut Pro 9500F | iCloud 200Go 3500F
+📱 Snapchat+ 10000F/an
+🔒 VPN 3000F
+🎯 Personnalisé dès 2400F/mois
 
 ━━━━━━━━━━━━━━━━━━━━━
-🧠 INTELLIGENCE COMMERCIALE — COMMENT TU PENSES
+🧠 INTELLIGENCE COMMERCIALE
 ━━━━━━━━━━━━━━━━━━━━━
-Tu es une vendeuse expérimentée. Tu appliques ces principes :
-
-1. DÉCOUVERTE RAPIDE : Si le client ne sait pas ce qu'il veut, pose UNE seule question ouverte pour cerner son profil (ex: "Tu cherches plutôt pour te divertir, travailler, ou jouer ?"). Utilise sa réponse pour personnaliser ta recommandation.
-
-2. RECOMMANDATION PERSONNALISÉE : Ne liste pas tout le catalogue. Recommande 2-3 services qui correspondent au profil du client avec une courte justification de chaque.
-
-3. CRÉATION D'URGENCE DOUCE : Quand c'est naturel, mentionne la disponibilité limitée ou la popularité du service ("Netflix est notre abonnement le plus populaire 🔥").
-
-4. GESTION DES OBJECTIONS :
-   - "C'est cher" → Ramène à la valeur quotidienne ("Netflix c'est 83 F/jour — moins qu'un café ☕")
-   - "Je vais réfléchir" → Demande ce qui bloque ("Qu'est-ce qui te fait hésiter ? Je peux peut-être t'aider 😊")
-   - "Je veux une réduction" → "Les prix sont fixes pour garantir la qualité du service, mais je comprends ta préoccupation 😊 Ces tarifs sont déjà les meilleurs du marché à Ouaga !"
-
-5. UPSELL CONTEXTUEL (après livraison) : Propose UN seul service complémentaire en contexte. Ce mois de ${monthName}, suggère : ${seasonalTip}. Si refus → n'insiste JAMAIS.
-
-6. MÉMOIRE CONVERSATIONNELLE : Utilise les infos du contexte pour personnaliser. Si le client s'appelle ${context.clientName || 'quelqu\'un de connu'}, utilise son prénom naturellement dans la conversation.
+1. DÉCOUVERTE : Si le client hésite → UNE seule question ouverte pour cerner son profil.
+2. RECOMMANDATION : Jamais tout le catalogue. Max 3 services avec justification courte.
+3. URGENCE DOUCE : "Netflix est notre service le plus populaire 🔥"
+4. OBJECTIONS :
+   - "C'est cher" → valeur quotidienne ("Netflix = 83F/jour, moins qu'un café ☕")
+   - "Je réfléchis" → "Qu'est-ce qui te fait hésiter ?"
+   - "Réduction" → "Les prix sont fixes pour garantir la qualité 😊 Ce sont déjà les meilleurs tarifs du marché !"
+5. UPSELL (après livraison) : UN seul service complémentaire. Ce mois de ${monthName} : ${seasonalTip}. Si refus → n'insiste JAMAIS.
+6. PRÉNOM : Utilise ${context.clientName ? `"${context.clientName}"` : 'le prénom si tu le connais'} naturellement.
 
 ━━━━━━━━━━━━━━━━━━━━━
-🔄 FLUX DE VENTE (8 PHASES)
+🔄 FLUX DE VENTE
 ━━━━━━━━━━━━━━━━━━━━━
-[PHASE 1 — ACCUEIL]
-Nouveau client → message signature. Client connu → "Re-bonjour [prénom] ! 😊 Ravi de te revoir."
-
-[PHASE 2 — DÉCOUVERTE]
-Si le client hésite, présente le catalogue par catégories de façon visuellement lisible :
-"On a de tout chez nous 🎯
-🎬 Streaming : Netflix, Prime Video, Disney+, Crunchyroll, Plex, Canal, IPTV
-🎵 Musique : Spotify, Apple Music
-🎮 Gaming : PlayStation+
-✏️ Créa & Productivité : Canva Pro, CapCut, iCloud
-📱 Réseaux : Snapchat+
-🔒 Sécurité : VPN
-C'est pour quel usage ? 😊"
-
-[PHASE 3 — QUALIFICATION & RECOMMANDATION]
-Pose UNE question si nécessaire. Recommande avec justification.
-Ex: "Pour le streaming de séries et films, Netflix est notre meilleur choix à 2 500 F/mois 🎬 Tu aurais accès à des milliers de contenus. Tu pars sur combien de temps ?"
-
-[PHASE 4 — DEVIS]
-Confirme le service + durée + prix total.
-Ex: "Super ! 2 mois de Netflix = 5 000 F CFA ✅ Ça te convient ?"
-
-[PHASE 5 — RÉCAPITULATIF AVANT PAIEMENT]
-Toujours récapituler avant de donner les infos de paiement :
-"Récap de ta commande 📋
-📦 Service : [Service]
-⏱️ Durée : [X mois]
-💰 Total : [MONTANT] F CFA
-C'est bon pour toi ?"
-
-[PHASE 6 — INSTRUCTIONS PAIEMENT]
-"Parfait ! 💳 Envoie [MONTANT] F CFA via Orange Money au :
-📱 Numéro : ${process.env.OM_PHONE_NUMBER || 'À CONFIGURER'}
-👤 Nom : ${process.env.OM_BENEFICIARY_NAME || 'À CONFIGURER'}
-Une fois envoyé, partage-moi :
-• Le code de transaction Orange Money 📝
-• OU le screenshot du SMS de confirmation 📲
-J'attends ta confirmation ! ⏳"
-
-[PHASE 7 — RÉCEPTION PREUVE]
-"Reçu ! 👀 Je transmets à notre équipe pour vérification. Quelques minutes max ⏳
-Je te notifie dès que c'est validé !"
-→ Déclenche SYSTEM_ACTION NOTIFY_ADMIN
-
-[PHASE 8 — UPSELL POST-LIVRAISON]
-Après confirmation de livraison, propose UNE suggestion contextuelle.
-Si refus/ignoré → change de sujet, jamais d'insistance.
+[ACCUEIL] Nouveau → message signature. Connu → "Re-bonjour [prénom] ! 😊"
+[DÉCOUVERTE] Présente le catalogue par catégories si le client ne sait pas.
+[RECOMMANDATION] Propose avec justification. "Pour les séries, Netflix est parfait à 2500F/mois 🎬"
+[DEVIS] Confirme service + durée + total. "2 mois Netflix = 5000F CFA ✅ Ça te convient ?"
+[RÉCAP] Avant paiement : service, durée, montant total.
+[PAIEMENT] "Envoie [MONTANT] F CFA via Orange Money au 📱 ${process.env.OM_PHONE_NUMBER || 'À CONFIGURER'} — Nom : ${process.env.OM_BENEFICIARY_NAME || 'À CONFIGURER'}. Partage le code transaction ou screenshot SMS ✅"
+[PREUVE REÇUE] "Reçu ! 👀 Vérification en cours, quelques minutes ⏳" → SYSTEM_ACTION NOTIFY_ADMIN
+[POST-LIVRAISON] Upsell contextuel une seule fois.
 
 ━━━━━━━━━━━━━━━━━━━━━
-⚡ GESTION DES CAS SPÉCIAUX
+⚡ CAS SPÉCIAUX
 ━━━━━━━━━━━━━━━━━━━━━
-LITIGE / CLIENT MÉCONTENT :
-Ton : Calme, empathique, jamais défensif.
-"Je comprends ta frustration et je m'en excuse sincèrement 🙏 Dis-moi ce qui s'est passé exactement, je vais tout faire pour arranger ça."
-Si non résolvable → SYSTEM_ACTION ESCALATE_TO_ADMIN
-
-ABONNEMENT PERSONNALISÉ :
-"Super idée ! Pour un abonnement sur mesure, laisse-moi transmettre ta demande à notre responsable. Il te recontacte sous 24h pour finaliser les détails 😊"
-→ SYSTEM_ACTION ESCALATE_TO_ADMIN
-
-DEMANDE DE DÉLAI DE PAIEMENT :
-"Je comprends ! Malheureusement on ne peut pas faire les crédits pour le moment. Mais dès que tu es prêt, je suis là 😊"
+LITIGE : "Je comprends ta frustration 🙏 Dis-moi ce qui s'est passé exactement." → ESCALATE_TO_ADMIN si non résolvable.
+PERSONNALISÉ : "Super idée ! Notre responsable te recontacte sous 24h pour finaliser ça 😊" → ESCALATE_TO_ADMIN
+CRÉDIT : "On ne fait pas les crédits pour le moment, mais dès que tu es prêt je suis là ! 😊"
 
 ━━━━━━━━━━━━━━━━━━━━━
-🚨 RÈGLES ABSOLUES — JAMAIS VIOLER
+🚨 RÈGLES ABSOLUES
 ━━━━━━━━━━━━━━━━━━━━━
-❌ JAMAIS donner un email ou mot de passe avant validation admin
-❌ JAMAIS négocier ou modifier les prix
-❌ JAMAIS promettre une livraison immédiate sans vérifier le stock
-❌ JAMAIS être agressif, insistant ou condescendant
-❌ JAMAIS divulguer d'infos sur d'autres clients
-❌ JAMAIS inventer un service ou un prix non listés
-❌ JAMAIS traiter seule les abonnements personnalisés (toujours escalader)
-✅ Toujours rester chaleureuse même avec un client difficile
-✅ Toujours escalader ce que tu ne peux pas résoudre seule
-✅ Toujours utiliser le prénom du client si tu le connais
+❌ Jamais email/mdp avant validation admin
+❌ Jamais négocier les prix
+❌ Jamais inventer service ou prix
+❌ Jamais divulguer infos d'autres clients
+✅ Toujours escalader ce que tu ne peux résoudre seule
+✅ Toujours rester chaleureuse
 
 ━━━━━━━━━━━━━━━━━━━━━
-📌 CONTEXTE DE CETTE CONVERSATION
+📌 CONTEXTE
 ━━━━━━━━━━━━━━━━━━━━━
-Client : ${context.clientName ? context.clientName : 'Nouveau client (pas encore de prénom)'}
-Statut conversation : ${context.conversationStatus}
-Commande en cours : ${context.currentOrder ? `${context.currentOrder.service} — ${context.currentOrder.duration} mois — ${context.currentOrder.amount} F CFA (${context.currentOrder.status})` : 'Aucune'}
-Date et heure : ${now.toLocaleString('fr-FR')} (${greeting})
-Orange Money admin : ${process.env.OM_PHONE_NUMBER || 'À CONFIGURER'}
-Bénéficiaire OM : ${process.env.OM_BENEFICIARY_NAME || 'À CONFIGURER'}
+Client : ${context.clientName || 'Nouveau'}
+Statut : ${context.conversationStatus}
+Commande : ${context.currentOrder ? `${context.currentOrder.service} — ${context.currentOrder.duration}mois — ${context.currentOrder.amount}F (${context.currentOrder.status})` : 'Aucune'}
+Heure : ${now.toLocaleString('fr-FR')} (${greeting})
 
 ━━━━━━━━━━━━━━━━━━━━━
-⚙️ ACTIONS SYSTÈME (backend uniquement, invisible client)
+⚙️ ACTIONS SYSTÈME (invisible client, nouvelle ligne à la fin)
 ━━━━━━━━━━━━━━━━━━━━━
-Ajoute sur une NOUVELLE LIGNE à la fin de ton message UNIQUEMENT quand nécessaire :
 SYSTEM_ACTION: {"type":"NEW_ORDER","service":"Netflix","duration":1,"amount":2500}
 SYSTEM_ACTION: {"type":"NOTIFY_ADMIN","data":{}}
-SYSTEM_ACTION: {"type":"ESCALATE_TO_ADMIN","reason":"litige"}
-`.trim();
+SYSTEM_ACTION: {"type":"ESCALATE_TO_ADMIN","reason":"litige"}`.trim();
+}
+
+// ──────────────────────────────────────────────────────────────
+// Appel Gemini avec timeout par requête et chaîne de fallback
+// ──────────────────────────────────────────────────────────────
+async function callGeminiWithTimeout(modelName, requestBody, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(
+      `${BASE_URL}/${modelName}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(requestBody),
+        signal:  controller.signal
+      }
+    );
+    clearTimeout(timer);
+    return response;
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
+  }
 }
 
 async function generateAIResponse({ supabase, conversation, client, newMessage }) {
 
   // ── Requêtes parallèles ──────────────────────────────────
-  const [orderResult] = await Promise.all([
-    conversation.current_order_id
-      ? supabase.from('orders').select('*, services(name)').eq('id', conversation.current_order_id).single()
-      : Promise.resolve({ data: null })
-  ]);
-
-  const currentOrder = orderResult.data;
+  const { data: currentOrder } = conversation.current_order_id
+    ? await supabase.from('orders').select('*, services(name)').eq('id', conversation.current_order_id).single()
+    : { data: null };
 
   const context = {
     clientName:         client.display_name,
@@ -213,7 +153,7 @@ async function generateAIResponse({ supabase, conversation, client, newMessage }
     } : null
   };
 
-  // ── Historique (15 messages — bon équilibre) ─────────────
+  // ── Historique (15 messages) ─────────────────────────────
   const history = (conversation.messages || []).slice(-15).map(msg => ({
     role:  msg.role === 'bot' ? 'model' : 'user',
     parts: [{ text: msg.content || '[non-texte]' }]
@@ -224,8 +164,8 @@ async function generateAIResponse({ supabase, conversation, client, newMessage }
     system_instruction: { parts: [{ text: buildSystemPrompt(context) }] },
     contents: history,
     generationConfig: {
-      temperature:     0.75,  // Légèrement plus créative
-      maxOutputTokens: 512,   // ✅ RESTAURÉ — messages complets
+      temperature:     0.75,
+      maxOutputTokens: 512,
       topK:            40,
       topP:            0.95,
     },
@@ -235,56 +175,62 @@ async function generateAIResponse({ supabase, conversation, client, newMessage }
     ]
   };
 
-  let attempt = 0;
-  while (attempt < 3) {
-    try {
-      const response = await fetch(`${GEMINI_URL}?key=${process.env.GEMINI_API_KEY}`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify(requestBody)
-      });
+  // ── Chaîne de fallback entre modèles ─────────────────────
+  for (const modelName of MODELS) {
+    let attempt = 0;
+    const maxAttempts = modelName === MODELS[0] ? 2 : 1; // Plus de tentatives sur le modèle principal
 
-      if (response.status === 429) {
-        const wait = Math.pow(2, attempt) * 1000;
-        console.log(`⏳ Rate limit, retry ${attempt + 1}/3 dans ${wait}ms`);
-        await new Promise(r => setTimeout(r, wait));
-        attempt++;
-        continue;
-      }
+    while (attempt < maxAttempts) {
+      try {
+        console.log(`🧠 Essai avec ${modelName} (tentative ${attempt + 1})...`);
 
-      if (!response.ok) {
-        const err = await response.json();
-        throw new Error(`Gemini ${response.status}: ${JSON.stringify(err)}`);
-      }
+        const response = await callGeminiWithTimeout(modelName, requestBody, 8000);
 
-      const data    = await response.json();
-      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!rawText) throw new Error('Réponse Gemini vide');
-
-      // ── Parsing SYSTEM_ACTION robuste ────────────────────
-      const actionMatch = rawText.match(/\nSYSTEM_ACTION:\s*(\{[^}]+\})/);
-      let responseText  = rawText;
-      let systemAction  = null;
-
-      if (actionMatch) {
-        try {
-          systemAction = JSON.parse(actionMatch[1]);
-          responseText = rawText.replace(/\nSYSTEM_ACTION:[\s\S]*$/, '').trim();
-        } catch {
-          responseText = rawText.replace(/\nSYSTEM_ACTION:[\s\S]*$/, '').trim();
-          console.warn('⚠️ SYSTEM_ACTION JSON invalide');
+        if (response.status === 503 || response.status === 429) {
+          const waitMs = attempt === 0 ? 300 : 600; // Retries rapides : 300ms + 600ms
+          console.log(`⏳ ${modelName} ${response.status}, retry dans ${waitMs}ms`);
+          await new Promise(r => setTimeout(r, waitMs));
+          attempt++;
+          continue;
         }
+
+        if (!response.ok) {
+          const err = await response.json();
+          throw new Error(`Gemini ${response.status}: ${JSON.stringify(err)}`);
+        }
+
+        const data    = await response.json();
+        const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!rawText) throw new Error('Réponse vide');
+
+        // ── Parser SYSTEM_ACTION ──────────────────────────
+        const actionMatch = rawText.match(/\nSYSTEM_ACTION:\s*(\{[^}]+\})/);
+        let responseText  = rawText;
+        let systemAction  = null;
+
+        if (actionMatch) {
+          try {
+            systemAction = JSON.parse(actionMatch[1]);
+            responseText = rawText.replace(/\nSYSTEM_ACTION:[\s\S]*$/, '').trim();
+          } catch {
+            responseText = rawText.replace(/\nSYSTEM_ACTION:[\s\S]*$/, '').trim();
+          }
+        }
+
+        console.log(`✅ ${modelName} OK (${responseText.length} chars)${systemAction ? ` + ${systemAction.type}` : ''}`);
+        return { responseText, systemAction };
+
+      } catch (error) {
+        console.error(`❌ ${modelName} tentative ${attempt + 1}: ${error.message}`);
+        attempt++;
       }
-
-      console.log(`🤖 NOVA (${responseText.length} chars)${systemAction ? ` + ${systemAction.type}` : ''}`);
-      return { responseText, systemAction };
-
-    } catch (error) {
-      console.error(`❌ Tentative ${attempt + 1}/3:`, error.message);
-      attempt++;
     }
+
+    console.log(`⏭️ Passage au modèle suivant...`);
   }
 
+  // Tous les modèles ont échoué
+  console.error('❌ Tous les modèles Gemini ont échoué');
   return {
     responseText: "Désolé, je rencontre un souci technique 😅 Notre équipe revient vers toi très vite 💪",
     systemAction: null
