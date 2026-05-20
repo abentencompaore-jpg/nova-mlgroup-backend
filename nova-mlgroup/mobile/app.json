@@ -28,6 +28,15 @@
     ],
     "experiments": {
       "typedRoutes": true
-    }
+    },
+    "extra": {
+      "router": {
+        "origin": false
+      },
+      "eas": {
+        "projectId": "d51a7b6c-b727-4521-a392-dcfd2f947b31"
+      }
+    },
+    "owner": "abenten"
   }
 }
